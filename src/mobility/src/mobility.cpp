@@ -7,6 +7,7 @@
 
 //ROS messages
 #include <std_msgs/Int16.h>
+#include <std_msgs/Int32.h>
 #include <std_msgs/UInt8.h>
 #include <std_msgs/String.h>
 #include <sensor_msgs/Joy.h>
@@ -24,21 +25,32 @@
 
 using namespace std;
 
-//Random number generator
-random_numbers::RandomNumberGenerator* rng;	
-
 //Mobility Logic Functions
 void setVelocity(double linearVel, double angularVel);
+void nextGoalSet();
+void SearchLevelSearch();
 
 //Numeric Variables
 geometry_msgs::Pose2D currentLocation;
 geometry_msgs::Pose2D goalLocation;
+geometry_msgs::Pose2D returnLocation;
+geometry_msgs::Pose2D oldLocation;
 int currentMode = 0;
 float mobilityLoopTimeStep = 0.1; //time between the mobility loop calls
 float status_publish_interval = 5;
 float killSwitchTimeout = 10;
+float obstacle_handler_time = 3;
 std_msgs::Int16 targetDetected; //ID of the detected target
 bool targetsCollected [256] = {0}; //array of booleans indicating whether each target ID has been found
+
+int searchX [4] = {1,-1,-1,1};
+int searchY [4] = {1,1,-1,-1};
+int searchCorner = 0;
+int SearchLevel;
+double searchFactor = 1;
+bool returnSuccess = true;
+int returnState;
+std_msgs::Int32 SearchLevelArray;
 
 // state machine states
 #define STATE_MACHINE_TRANSFORM	0
@@ -58,6 +70,9 @@ ros::Publisher status_publisher;
 ros::Publisher targetCollectedPublish;
 ros::Publisher targetPickUpPublish;
 ros::Publisher targetDropOffPublish;
+ros::Publisher SearchLevelPublish;
+ros::Publisher NewLocationPublish;
+ros::Publisher oldLocationPublish;
 
 //Subscribers
 ros::Subscriber joySubscriber;
@@ -66,11 +81,13 @@ ros::Subscriber targetSubscriber;
 ros::Subscriber obstacleSubscriber;
 ros::Subscriber odometrySubscriber;
 ros::Subscriber targetsCollectedSubscriber;
+ros::Subscriber SearchLevelSubscriber;
 
 //Timers
 ros::Timer stateMachineTimer;
 ros::Timer publish_status_timer;
 ros::Timer killSwitchTimer;
+ros::Timer obstacle_timer;
 
 // OS Signal Handler
 void sigintEventHandler(int signal);
@@ -85,21 +102,19 @@ void mobilityStateMachine(const ros::TimerEvent&);
 void publishStatusTimerEventHandler(const ros::TimerEvent& event);
 void targetsCollectedHandler(const std_msgs::Int16::ConstPtr& message);
 void killSwitchTimerEventHandler(const ros::TimerEvent& event);
+void SearchLevelHandler(const std_msgs::Int32::ConstPtr& message);
+void obstacle_handle_timer(const ros::TimerEvent& event);
 
 int main(int argc, char **argv) {
 
     gethostname(host, sizeof (host));
     string hostname(host);
 
-    rng = new random_numbers::RandomNumberGenerator(); //instantiate random number generator
-    goalLocation.theta = rng->uniformReal(0, 2 * M_PI); //set initial random heading
-    
     targetDetected.data = -1; //initialize target detected
     
     //select initial search position 50 cm from center (0,0)
-	goalLocation.x = 0.5 * cos(goalLocation.theta);
-	goalLocation.y = 0.5 * sin(goalLocation.theta);
-
+    nextGoalSet();
+    SearchLevelArray.data = 3;
     if (argc >= 2) {
         publishedName = argv[1];
         cout << "Welcome to the world of tomorrow " << publishedName << "!  Mobility module started." << endl;
@@ -120,6 +135,7 @@ int main(int argc, char **argv) {
     obstacleSubscriber = mNH.subscribe((publishedName + "/obstacle"), 10, obstacleHandler);
     odometrySubscriber = mNH.subscribe((publishedName + "/odom/ekf"), 10, odometryHandler);
     targetsCollectedSubscriber = mNH.subscribe(("targetsCollected"), 10, targetsCollectedHandler);
+    SearchLevelSubscriber=mNH.subscribe(("SearchLevelArray"), 1, SearchLevelHandler);
 
     status_publisher = mNH.advertise<std_msgs::String>((publishedName + "/status"), 1, true);
     velocityPublish = mNH.advertise<geometry_msgs::Twist>((publishedName + "/velocity"), 10);
@@ -127,11 +143,15 @@ int main(int argc, char **argv) {
     targetCollectedPublish = mNH.advertise<std_msgs::Int16>(("targetsCollected"), 1, true);
     targetPickUpPublish = mNH.advertise<sensor_msgs::Image>((publishedName + "/targetPickUpImage"), 1, true);
     targetDropOffPublish = mNH.advertise<sensor_msgs::Image>((publishedName + "/targetDropOffImage"), 1, true);
+    SearchLevelPublish=mNH.advertise<std_msgs::Int32>(("SearchLevelArray"), 1, true);
+    NewLocationPublish=mNH.advertise<geometry_msgs::Pose2D>((publishedName +"/goalLocation"), 1, true);
+    oldLocationPublish=mNH.advertise<geometry_msgs::Pose2D>((publishedName +"/oldLocation"), 1, true);
 
     publish_status_timer = mNH.createTimer(ros::Duration(status_publish_interval), publishStatusTimerEventHandler);
     killSwitchTimer = mNH.createTimer(ros::Duration(killSwitchTimeout), killSwitchTimerEventHandler);
     stateMachineTimer = mNH.createTimer(ros::Duration(mobilityLoopTimeStep), mobilityStateMachine);
-    
+    obstacle_timer = mNH.createTimer(ros::Duration(obstacle_handler_time), obstacle_handle_timer, true);
+
     ros::spin();
     
     return EXIT_SUCCESS;
@@ -149,7 +169,7 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 			case STATE_MACHINE_TRANSFORM: {
 				stateMachineMsg.data = "TRANSFORMING";
 				//If angle between current and goal is significant
-				if (fabs(angles::shortest_angular_distance(currentLocation.theta, goalLocation.theta)) > 0.1) {
+				if (fabs(angles::shortest_angular_distance(currentLocation.theta, goalLocation.theta)) > 0.2) {
 					stateMachineState = STATE_MACHINE_ROTATE; //rotate
 				}
 				//If goal has not yet been reached
@@ -170,17 +190,42 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 					//Otherwise, reset target and select new random uniform heading
 					else {
 						targetDetected.data = -1;
-						goalLocation.theta = rng->uniformReal(0, 2 * M_PI);
+						//This is where we set next location
+						goalLocation.x = returnLocation.x;
+						goalLocation.y = returnLocation.y;
+						goalLocation.theta = atan2(goalLocation.y - currentLocation.y, goalLocation.x -currentLocation.x);
+						searchCorner--;
 					}
 				}
+			
+				else if (returnState != 0 && hypot(returnLocation.x - currentLocation.x, returnLocation.y - currentLocation.y) < 0.5){
+					returnSuccess = true;
+					returnState = 0;
+					/*
+					if (returnState == 1){
+						goalLocation.theta = goalLocation.theta + .1;
+						returnState++;
+					}
+					else if (returnState == 2){
+						goalLocation.theta = goalLocation.theta - .1;
+						returnState++;
+					}
+					else {
+						returnSuccess = true;
+						returnState = 0;
+ 					}
+					*/
+				}
+			
 				//Otherwise, assign a new goal
 				else {
-					 //select new heading from Gaussian distribution around current heading
-					goalLocation.theta = rng->gaussian(currentLocation.theta, 0.25);
-					
-					//select new position 50 cm from current location
-					goalLocation.x = currentLocation.x + (0.5 * cos(goalLocation.theta));
-					goalLocation.y = currentLocation.y + (0.5 * sin(goalLocation.theta));
+					if (returnSuccess)
+						nextGoalSet();
+					else {
+						goalLocation.x = returnLocation.x;
+						goalLocation.y = returnLocation.y;
+						goalLocation.theta = atan2(goalLocation.y - currentLocation.y, goalLocation.x -currentLocation.x);
+					}
 				}
 				
 				//Purposefully fall through to next case without breaking
@@ -210,7 +255,7 @@ void mobilityStateMachine(const ros::TimerEvent&) {
 			case STATE_MACHINE_TRANSLATE: {
 				stateMachineMsg.data = "TRANSLATING";
 				if (fabs(angles::shortest_angular_distance(currentLocation.theta, atan2(goalLocation.y - currentLocation.y, goalLocation.x - currentLocation.x))) < M_PI_2) {
-					setVelocity(0.3, 0.0);
+					setVelocity(0.25, 0.0);
 				}
 				else {
 					setVelocity(0.0, 0.0); //stop
@@ -255,6 +300,17 @@ void setVelocity(double linearVel, double angularVel)
  * ROS CALLBACK HANDLERS
  ************************/
 
+
+void obstacle_handle_timer(const ros::TimerEvent& event) {
+	obstacle_timer.stop();
+	
+	goalLocation.x = oldLocation.x;
+	goalLocation.y = oldLocation.y;
+	goalLocation.theta = atan2(goalLocation.y - currentLocation.y, goalLocation.x -currentLocation.x);
+	oldLocationPublish.publish(oldLocation);
+}
+
+
 void targetHandler(const shared_messages::TagsImage::ConstPtr& message) {
 
 	//if this is the goal target
@@ -274,6 +330,13 @@ void targetHandler(const shared_messages::TagsImage::ConstPtr& message) {
         if (!targetsCollected[message->tags.data[0]]) {
 			//copy target ID to class variable
 			targetDetected.data = message->tags.data[0];
+
+		//set return Location
+			returnLocation.x = currentLocation.x;
+			returnLocation.y = currentLocation.y;
+			returnLocation.theta = currentLocation.theta;
+			returnSuccess = false;
+			returnState = 1;
 			
 	        //set angle to center as goal heading
 			goalLocation.theta = M_PI + atan2(currentLocation.y, currentLocation.x);
@@ -294,6 +357,20 @@ void targetHandler(const shared_messages::TagsImage::ConstPtr& message) {
     }
 }
 
+void nextGoalSet(){
+	if (searchCorner > 3) {
+		SearchLevelArray.data+=4^(SearchLevel);		
+		SearchLevelSearch();
+		searchCorner = 0;
+	}
+		
+	goalLocation.x = searchX[searchCorner]*SearchLevel*searchFactor;
+	goalLocation.y = searchY[searchCorner]*SearchLevel*searchFactor;
+	goalLocation.theta = atan2(goalLocation.y - currentLocation.y, goalLocation.x -currentLocation.x);
+	//NewLocationPublish.publish(goalLocation);
+	searchCorner++;
+}
+
 void modeHandler(const std_msgs::UInt8::ConstPtr& message) {
 	currentMode = message->data;
 	setVelocity(0.0, 0.0);
@@ -301,19 +378,34 @@ void modeHandler(const std_msgs::UInt8::ConstPtr& message) {
 
 void obstacleHandler(const std_msgs::UInt8::ConstPtr& message) {
 	if (message->data > 0) {
-		//obstacle on right side
+	//obstacle on right side
+		// WE ADDED THIS STUFF - start
+		oldLocation.x = goalLocation.x;
+		oldLocation.y = goalLocation.y;
+		// WE ADDED THIS STUFF - end
+		
 		if (message->data == 1) {
-			//select new heading 0.2 radians to the left
+			//select new heading 0.2 radians to the leftgoallocation.arra
+			
 			goalLocation.theta = currentLocation.theta + 0.2;
+			
 		}
 		
 		//obstacle in front or on left side
 		else if (message->data == 2) {
 			//select new heading 0.2 radians to the right
+			
+			
 			goalLocation.theta = currentLocation.theta - 0.2;
+			
 		}
-							
+		
+		// WE ADDED THIS STUFF - start
+		obstacle_timer.start();
+		// WE ADDED THIS STUFF - end
+		
 		//select new position 50 cm from current location
+		
 		goalLocation.x = currentLocation.x + (0.5 * cos(goalLocation.theta));
 		goalLocation.y = currentLocation.y + (0.5 * sin(goalLocation.theta));
 		
@@ -346,7 +438,7 @@ void joyCmdHandler(const geometry_msgs::Twist::ConstPtr& message) {
 void publishStatusTimerEventHandler(const ros::TimerEvent&)
 {
   std_msgs::String msg;
-  msg.data = "online";
+  msg.data = "CCNY Robotics Club: Operation Gaccu in effect.";
   status_publisher.publish(msg);
 }
 
@@ -369,3 +461,49 @@ void sigintEventHandler(int sig)
      // All the default sigint handler does is call shutdown()
      ros::shutdown();
 }
+
+void SearchLevelHandler(const std_msgs::Int32::ConstPtr& message) {
+	SearchLevelArray.data = message->data;
+}
+
+
+void SearchLevelSearch(){
+
+   if(SearchLevelArray.data<4){
+	SearchLevel=1;
+	SearchLevelArray.data+=4;
+   }else if(SearchLevelArray.data<16){
+	SearchLevel=2;
+	SearchLevelArray.data+=16;
+   }else if(SearchLevelArray.data<64){
+	SearchLevel=3;
+	SearchLevelArray.data+=64;		
+   }else if(SearchLevelArray.data<256){
+	SearchLevel=4;
+	SearchLevelArray.data+=256;	
+   }else if(SearchLevelArray.data<1024){
+	SearchLevel=5;
+	SearchLevelArray.data+=1024;
+   }else if(SearchLevelArray.data<4096){
+	SearchLevel=6;
+	SearchLevelArray.data +=4096;
+   }else if(SearchLevelArray.data <16384){
+	SearchLevel=7;
+	SearchLevelArray.data +=16384;
+   }else if(SearchLevelArray.data <65536){
+	//SearchLevel=8;
+	SearchLevelArray.data +=65536;
+   }else if(SearchLevelArray.data <262144){
+	//SearchLevel=9;
+	SearchLevelArray.data +=262144;
+   }else if(SearchLevelArray.data <1048576){
+	//SearchLevel=10;
+	SearchLevelArray.data +=1048576;
+   }else {
+	SearchLevel++;
+	SearchLevel = SearchLevel%7;
+   }
+   SearchLevelPublish.publish(SearchLevelArray);
+
+}
+
